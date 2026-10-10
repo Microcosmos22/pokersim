@@ -19,6 +19,22 @@ GAME_PARAMS = (
     ")"
 )
 
+class PassiveBot:
+    def __init__(self, player_id):
+        self.player_id = player_id
+
+    def step(self, state):
+        actions = state.legal_actions()
+        named = [(a, state.action_to_string(a).lower()) for a in actions]
+
+        for preferred in ("check", "call"):
+            matches = [a for a, name in named if preferred in name]
+            if matches:
+                return matches[0]
+
+        folds = [a for a, name in named if "fold" in name]
+        return folds[0] if folds else actions[0]
+
 
 def play_one_hand(game, bots, rng):
     state = game.new_initial_state()
@@ -41,7 +57,7 @@ def main(num_hands=1000, seed=42):
     rng = random.Random(seed)
 
     bots = [
-        pyspiel.make_uniform_random_bot(0, seed),
+        PassiveBot(0),
         pyspiel.make_uniform_random_bot(1, seed + 1),
     ]
 
