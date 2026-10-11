@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 from tracking import make_logged_learn_advantage
 import numpy as np
 import torch
+from heuristicMC import HeuristicPokerBot
 
 # Make Python load our locally compiled OpenSpiel module first
 sys.path.insert(
@@ -17,7 +18,7 @@ sys.path.insert(
 import pyspiel
 from open_spiel.python.pytorch import deep_cfr
 
-GAME_PARAMS = ("universal_poker(""betting=nolimit,""numPlayers=6,""numRounds=4,""blind=2 1 0 0 0 0,""firstPlayer=2 1 1 1,""numSuits=4,""numRanks=13,""numHoleCards=2,""numBoardCards=0 3 1 1,""stack=400 400 400 400 400 400,""bettingAbstraction=fcpa"")")
+GAME_PARAMS = "universal_poker(betting=nolimit,numPlayers=4,numRounds=4,blind=2 1 0 0,firstPlayer=2 1 1 1,numSuits=4,numRanks=13,numHoleCards=2,numBoardCards=0 3 1 1,stack=400 400 400 400,bettingAbstraction=fcpa)"
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
@@ -25,9 +26,13 @@ torch.manual_seed(SEED)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # ============================================================
 # 2. TRAINING HYPERPARAMETERS
+validation_interval = 5
+VALIDATION_SEED = 42
+VALIDATION_HANDS = 400
+BIG_BLIND = 2
 
-NUM_ITERATIONS = 100
-NUM_TRAVERSALS = 20
+NUM_ITERATIONS = 20000
+NUM_TRAVERSALS = 100
 
 POLICY_TRAIN_STEPS = 100
 ADVANTAGE_TRAIN_STEPS = 50
@@ -39,36 +44,50 @@ ADVANTAGE_HIDDEN = [128, 128]
 SEED = 42
 # Seed random-number generators to help make experiments reproducible.
 
+training_history = {"iteration": [],"player": [],
+    "advantage_loss": [],"loss_policy_MSE": []}
+validation_history = {"iteration": [], "mean_return_bb": []}
+
 CHECKPOINT_PATH = os.path.join("models", f"deepcfr_policy_it{NUM_ITERATIONS}_tr{NUM_TRAVERSALS}.pt")
 # File where the trained policy and training metadata will be saved.
 
 import collections
-
-def validate_policy(game, policy_network, validation_history, iteration):
-    VALIDATION_SEED = 42
-    VALIDATION_HANDS = 200
+def validate_policy(
+    policy_network,
+    iteration,
+    game,
+    device,
+    validation_history,
+):
     rng = np.random.default_rng(VALIDATION_SEED)
-
-    # The current policy being trained, not a saved checkpoint.
-    trained_bot = DeepCFRBot(player_id=0,policy_net=policy_network,device=device,seed=VALIDATION_SEED,)
-
     returns_bb = []
+    num_players = game.num_players()
 
     for hand in range(VALIDATION_HANDS):
-        bots = [None] * 6
+        tested_seat = hand % num_players
+        seed_base = VALIDATION_SEED + hand * num_players
 
-        bots[0] = trained_bot # One DeepCFRBot, one PassiveBot
-        bots[1] = PassiveBot(1)
+        bots = [None] * num_players
 
-        # Seats 2-5: four random opponents.
-        for seat in range(2, 6):
-            bots[seat] = pyspiel.make_uniform_random_bot(seat,VALIDATION_SEED + 10_000 * hand + seat,)
+        bots[tested_seat] = DeepCFRBot(
+            player_id=tested_seat,
+            policy_net=policy_network,
+            device=device,
+            seed=seed_base + tested_seat,
+        )
 
-        # Play one complete hand.
+        for seat in range(num_players):
+            if seat == tested_seat:
+                continue
+
+            bots[seat] = HeuristicPokerBot(
+                player_id=seat,
+                seed=seed_base + seat,
+                equity_samples=32,
+            )
+
         result = play_hand(game, bots, rng)
-
-        # Record the trained bot's return in big blinds.
-        returns_bb.append(float(result[0]) / 1)
+        returns_bb.append(float(result[tested_seat]) / BIG_BLIND)
 
     mean_return_bb = float(np.mean(returns_bb))
 
@@ -83,11 +102,11 @@ def validate_policy(game, policy_network, validation_history, iteration):
 
     return mean_return_bb
 
-def solve_with_validation(game, solver, validate_fn, validation_history, validation_interval=2):
+def solve_with_validation(game, solver, validate_fn, validation_history, training_history, validation_interval=2):
     advantage_losses = collections.defaultdict(list)
 
-    for _ in range(solver._num_iterations):
-
+    for i in range(solver._num_iterations):
+        print(f" Iteration {i}")
         # 1. Collect traversal samples and train each player's
         #    advantage network, just as OpenSpiel normally does.
         for player in range(solver._num_players):
@@ -106,12 +125,24 @@ def solve_with_validation(game, solver, validate_fn, validation_history, validat
 
         # 2. Validate at the requested interval.
         if completed_iteration % validation_interval == 0:
-            # Train/update the policy network using accumulated
-            # strategy memory before evaluating it.
             policy_loss = solver._learn_strategy_network()
 
-            # Evaluate the current policy against fixed opponents.
-            mean_return_bb = validate_fn(game, solver._policy_network, validation_history, completed_iteration)
+            mean_return_bb = validate_fn(solver._policy_network,i,game,device,validation_history,)
+
+            input_size = game.information_state_tensor_size()
+            output_size = game.num_distinct_actions()
+            checkpoint = {
+                "game_params": GAME_PARAMS,
+                "input_size": input_size,
+                "output_size": output_size,
+                "policy_hidden_sizes": POLICY_HIDDEN,
+                "seed": SEED,
+                # Learned neural-network parameters.
+                "policy_state_dict": solver._policy_network.state_dict()
+            }
+            plot_training(training_history, validation_history, validation_interval)
+            torch.save(checkpoint, CHECKPOINT_PATH)
+            print("Saved checkpoint:", CHECKPOINT_PATH)
 
             print(
                 f"Validation at iteration {completed_iteration} | "
@@ -127,16 +158,11 @@ def solve_with_validation(game, solver, validate_fn, validation_history, validat
 def main():
 
     game = pyspiel.load_game(GAME_PARAMS)
-
-    # Number of input features in OpenSpiel's information-state
-    # encoding and number of distinct action IDs in the game.
     input_size = game.information_state_tensor_size()
     output_size = game.num_distinct_actions()
 
     print_network_config(input_size, output_size, ADVANTAGE_HIDDEN, POLICY_HIDDEN)
 
-    # --------------------------------------------------------
-    # 5C. INITIALIZE THE DEEP CFR SOLVER
     """input_size': 281, 'output_size': 4, 'policy_hidden_sizes': [256, 256], 'seed': 42, 'policy_state_dict': OrderedDict({'
     """
     solver = deep_cfr.DeepCFRSolver(game,policy_network_layers=POLICY_HIDDEN,advantage_network_layers=ADVANTAGE_HIDDEN,num_iterations=NUM_ITERATIONS,
@@ -145,29 +171,31 @@ def main():
         reinitialize_advantage_networks=True,device=device,seed=SEED,print_nash_convs=False,
     )
 
+    ###############################     LOAD
+
+    checkpoint = torch.load(
+        os.path.join("models", f"deepcfr_policy_it200_tr100.pt"),
+        map_location=device,
+        weights_only=False,
+    )
+    print(f"Loading warmup model: {os.path.join("models", f"deepcfr_policy_it200_tr100.pt")}")
+    solver._policy_network.load_state_dict(
+        checkpoint["policy_state_dict"]
+    )
+
     # -------------------------------------------------------- #
     # 5F. RUN TRAINING #########################################
     # -------------------------------------------------------- #
-    training_history = {
-        "iteration": [],
-        "player": [],
-        "advantage_loss": [],
-        "loss_policy_MSE": [],
-    }
-    validation_history = {
-        "iteration": [],
-        "mean_return_bb": [],
-    }
 
     solver._learn_advantage_network = make_logged_learn_advantage(solver, training_history)
 
 
-    solve_with_validation(game, solver, validate_policy, validation_history, validation_interval=2)
+    policy_net, advantage_losses, final_policy_loss = solve_with_validation(game, solver, validate_policy, validation_history, training_history, validation_interval)
 
     print("\nTraining finished.")
     print("Final policy loss:", final_policy_loss)
 
-    plot_training(training_history)
+    plot_training(training_history, validation_history, validation_interval)
 
     # --------------------------------------------------------
     # 5G. SAVE THE TRAINED POLICY CHECKPOINT

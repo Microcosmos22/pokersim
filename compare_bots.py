@@ -86,9 +86,7 @@ class PassiveBot:
 
 def load_policy(CHECKPOINT_PATH):
 
-    device = torch.device(
-        "cuda" if torch.cuda.is_available() else "cpu"
-    )
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     checkpoint = torch.load(CHECKPOINT_PATH, map_location=device)
     game = pyspiel.load_game(checkpoint["game_params"])
 
