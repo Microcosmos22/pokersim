@@ -14,7 +14,7 @@ from open_spiel.python.pytorch import deep_cfr
 
 CHECKPOINT_PATH = os.path.join("models", "deepcfr_policy.pt")
 CHECKPOINT_PATH_1 = os.path.join("models", "deepcfr_policy_it100_tr20.pt")
-NUM_HANDS = 100
+NUM_HANDS = 10000
 SEED = 123
 
 
@@ -127,69 +127,91 @@ def play_hand(game, bots, rng):
     return state.returns()
 
 
+
 def compare(game, trained_bots, device, opponent_type):
     rng = np.random.default_rng(SEED)
-    wins = losses = ties = 0
-    returns = []
+
+    # Separate statistics for each trained bot.
+    stats = [
+        {"wins": 0, "losses": 0, "ties": 0, "returns": []}
+        for _ in trained_bots
+    ]
 
     for hand in range(NUM_HANDS):
-        # Alternate which trained bot is evaluated.
-        deep_seat = hand % 2
-
-        # Start with six seats.
         bots = [None] * 6
 
-        # Seat the two trained bots.
+        # Keep both trained bots in fixed seats.
         bots[0] = trained_bots[0]
         bots[1] = trained_bots[1]
 
-        # One passive bot.
         bots[2] = PassiveBot(2)
 
-        # Three random bots.
+        # Three uniform-random opponents.
         for seat in range(3, 6):
             bots[seat] = pyspiel.make_uniform_random_bot(
-                seat,
-                SEED + 10_000 * hand + seat
+                seat, SEED + 10_000 * hand + seat
             )
 
-        # Play only after all six seats have been assigned.
+        # Play one hand.
         result = play_hand(game, bots, rng)
 
-        value = float(result[deep_seat])
-        returns.append(value)
+        # Record the result for BOTH trained bots.
+        for seat, bot_stats in enumerate(stats):
+            value = float(result[seat])
+            bot_stats["returns"].append(value)
 
-        if value > 0:
-            wins += 1
-        elif value < 0:
-            losses += 1
-        else:
-            ties += 1
+            if value > 0:
+                bot_stats["wins"] += 1
+            elif value < 0:
+                bot_stats["losses"] += 1
+            else:
+                bot_stats["ties"] += 1
 
         if (hand + 1) % 10 == 0:
             print(f"{opponent_type}: {hand + 1}/{NUM_HANDS} hands")
 
-    print(f"\nDeep CFR vs {opponent_type}")
-    print(f"Wins: {wins} | Losses: {losses} | Ties: {ties}")
+    # Print an independent summary for each trained bot.
+    labels = ["Deep CFR 10 iterations", "Deep CFR 100 iterations"]
 
-    decisive = wins + losses
-    print(
-        "Win rate (excluding ties): "
-        f"{wins / decisive:.1%}" if decisive
-        else "Win rate: n/a"
-    )
-    print(f"Mean return per hand: {np.mean(returns):.2f}")
-    print(f"Total return: {np.sum(returns):.2f}")
+    for label, bot_stats in zip(labels, stats):
+        wins = bot_stats["wins"]
+        losses = bot_stats["losses"]
+        ties = bot_stats["ties"]
+        returns = np.asarray(bot_stats["returns"], dtype=float)
+
+        print(f"\n{label} vs {opponent_type}")
+        print(f"Wins: {wins} | Losses: {losses} | Ties: {ties}")
+
+        decisive = wins + losses
+        print(
+            "Win rate (excluding ties): "
+            f"{wins / decisive:.1%}" if decisive
+            else "Win rate (excluding ties): n/a"
+        )
+        print(f"Mean return per hand: {np.mean(returns):.2f}")
+        print(f"Total return: {np.sum(returns):.2f}")
+
+
 
 
 def main():
-    game, policy_net, device = load_policy(CHECKPOINT_PATH)
-    game, policy_net1, device = load_policy(CHECKPOINT_PATH_1)
+    # Load both trained policies.
+    game, policy_net_10, device = load_policy(CHECKPOINT_PATH)
+    game_1, policy_net_100, device_1 = load_policy(CHECKPOINT_PATH_1)
 
-    deep_bot = DeepCFRBot(0, policy_net, device, seed=SEED + hand)
-    deep_bot1 = DeepCFRBot(1, policy_net1, device, seed=SEED + hand)
+    # Make sure both checkpoints use the same game configuration.
+    # Use the game and device returned by the first checkpoint.
+    if game.get_parameters() != game_1.get_parameters():
+        raise ValueError("The two checkpoints use different game configurations.")
 
-    compare(game, [deep_bot, deep_bot1], device, "passive")
+    # Create one bot from each trained policy.
+    bot_10 = DeepCFRBot(0, policy_net_10, device, seed=SEED)
+    bot_100 = DeepCFRBot(1, policy_net_100, device, seed=SEED + 1)
+
+    # Compare them in six-player games against:
+    # - one passive bot
+    # - three uniform-random bots
+    compare(game, [bot_10, bot_100], device, "passive + 3 random")
 
 
 if __name__ == "__main__":
