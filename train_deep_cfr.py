@@ -1,4 +1,5 @@
 from tracking import *
+from compare_bots import *
 import os
 import random
 import sys
@@ -16,10 +17,12 @@ sys.path.insert(
 import pyspiel
 from open_spiel.python.pytorch import deep_cfr
 
-GAME_PARAMS = ("universal_poker(""betting=nolimit,""numPlayers=6,""numRounds=4,""blind=100 50 0 0 0 0,""firstPlayer=2 1 1 1,""numSuits=4,""numRanks=13,""numHoleCards=2,""numBoardCards=0 3 1 1,""stack=20000 20000 20000 20000 20000 20000,""bettingAbstraction=fcpa"")")
+GAME_PARAMS = ("universal_poker(""betting=nolimit,""numPlayers=6,""numRounds=4,""blind=2 1 0 0 0 0,""firstPlayer=2 1 1 1,""numSuits=4,""numRanks=13,""numHoleCards=2,""numBoardCards=0 3 1 1,""stack=400 400 400 400 400 400,""bettingAbstraction=fcpa"")")
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # ============================================================
 # 2. TRAINING HYPERPARAMETERS
 
@@ -41,20 +44,46 @@ CHECKPOINT_PATH = os.path.join("models", f"deepcfr_policy_it{NUM_ITERATIONS}_tr{
 
 import collections
 
-def validate_policy(policy_network, iteration):
-    # Insert your existing bot creation and play_hand logic here.
-    # Use one trained bot, one passive bot, and four random bots.
-    # Calculate the trained bot's mean payoff in big blinds per hand.
+def validate_policy(game, policy_network, validation_history, iteration):
+    VALIDATION_SEED = 42
+    VALIDATION_HANDS = 200
+    rng = np.random.default_rng(VALIDATION_SEED)
 
-    mean_return_bb = ...  # Calculate from the played hands.
+    # The current policy being trained, not a saved checkpoint.
+    trained_bot = DeepCFRBot(player_id=0,policy_net=policy_network,device=device,seed=VALIDATION_SEED,)
+
+    returns_bb = []
+
+    for hand in range(VALIDATION_HANDS):
+        bots = [None] * 6
+
+        bots[0] = trained_bot # One DeepCFRBot, one PassiveBot
+        bots[1] = PassiveBot(1)
+
+        # Seats 2-5: four random opponents.
+        for seat in range(2, 6):
+            bots[seat] = pyspiel.make_uniform_random_bot(seat,VALIDATION_SEED + 10_000 * hand + seat,)
+
+        # Play one complete hand.
+        result = play_hand(game, bots, rng)
+
+        # Record the trained bot's return in big blinds.
+        returns_bb.append(float(result[0]) / 1)
+
+    mean_return_bb = float(np.mean(returns_bb))
 
     validation_history["iteration"].append(iteration)
     validation_history["mean_return_bb"].append(mean_return_bb)
 
+    print(
+        f"Validation | Iteration {iteration} | "
+        f"{VALIDATION_HANDS} hands | "
+        f"Mean return: {mean_return_bb:.3f} BB/hand"
+    )
+
     return mean_return_bb
 
-
-def solve_with_validation(solver, validate_fn, validation_interval=20):
+def solve_with_validation(game, solver, validate_fn, validation_history, validation_interval=2):
     advantage_losses = collections.defaultdict(list)
 
     for _ in range(solver._num_iterations):
@@ -82,10 +111,7 @@ def solve_with_validation(solver, validate_fn, validation_interval=20):
             policy_loss = solver._learn_strategy_network()
 
             # Evaluate the current policy against fixed opponents.
-            mean_return_bb = validate_fn(
-                solver._policy_network,
-                completed_iteration,
-            )
+            mean_return_bb = validate_fn(game, solver._policy_network, validation_history, completed_iteration)
 
             print(
                 f"Validation at iteration {completed_iteration} | "
@@ -100,7 +126,6 @@ def solve_with_validation(solver, validate_fn, validation_interval=20):
 
 def main():
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     game = pyspiel.load_game(GAME_PARAMS)
 
     # Number of input features in OpenSpiel's information-state
@@ -108,7 +133,7 @@ def main():
     input_size = game.information_state_tensor_size()
     output_size = game.num_distinct_actions()
 
-    print_network_config(input_size, output_size, ADVANTAGE_HIDDEN)
+    print_network_config(input_size, output_size, ADVANTAGE_HIDDEN, POLICY_HIDDEN)
 
     # --------------------------------------------------------
     # 5C. INITIALIZE THE DEEP CFR SOLVER
@@ -137,7 +162,7 @@ def main():
     solver._learn_advantage_network = make_logged_learn_advantage(solver, training_history)
 
 
-    solve_with_validation(solver, validate_policy, validation_interval=20)
+    solve_with_validation(game, solver, validate_policy, validation_history, validation_interval=2)
 
     print("\nTraining finished.")
     print("Final policy loss:", final_policy_loss)

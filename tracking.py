@@ -81,7 +81,7 @@ def plot_training(training_history):
 
 
 
-def print_network_config(input_size, output_size, ADVANTAGE_HIDDEN):
+def print_network_config(input_size, output_size, ADVANTAGE_HIDDEN, POLICY_HIDDEN):
     print("\n========== NETWORK CONFIGURATION ==========")
     print(f"Input features: {input_size}")
     print(
