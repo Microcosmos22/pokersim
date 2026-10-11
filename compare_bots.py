@@ -1,13 +1,19 @@
 
 import os
-
+import sys
 import numpy as np
 import torch
+sys.path.insert(
+    0,
+    r"C:\Users\PC\Documents\open_spiel\build\lib.win-amd64-cpython-313"
+)
+
 import pyspiel
 from open_spiel.python.pytorch import deep_cfr
 
 
 CHECKPOINT_PATH = os.path.join("models", "deepcfr_policy.pt")
+CHECKPOINT_PATH_1 = os.path.join("models", "deepcfr_policy_it100_tr20.pt")
 NUM_HANDS = 100
 SEED = 123
 
@@ -78,11 +84,7 @@ class PassiveBot:
         return int(legal[0])
 
 
-def load_policy():
-    if not os.path.exists(CHECKPOINT_PATH):
-        raise FileNotFoundError(
-            f"{CHECKPOINT_PATH} not found. Run train_deep_cfr.py first."
-        )
+def load_policy(CHECKPOINT_PATH):
 
     device = torch.device(
         "cuda" if torch.cuda.is_available() else "cpu"
@@ -91,12 +93,8 @@ def load_policy():
     game = pyspiel.load_game(checkpoint["game_params"])
 
     # Reconstruct the same MLP architecture before loading its weights.
-    policy_net = deep_cfr.MLP(
-        input_size=checkpoint["input_size"],
-        hidden_sizes=checkpoint["policy_hidden_sizes"],
-        output_size=checkpoint["output_size"],
-        final_activation=torch.nn.Softmax(dim=-1),
-        seed=checkpoint["seed"],
+    policy_net = deep_cfr.MLP(input_size=checkpoint["input_size"],hidden_sizes=checkpoint["policy_hidden_sizes"],
+        output_size=checkpoint["output_size"],final_activation=torch.nn.Softmax(dim=-1),seed=checkpoint["seed"],
     ).to(device)
 
     policy_net.load_state_dict(checkpoint["policy_state_dict"])
@@ -129,33 +127,35 @@ def play_hand(game, bots, rng):
     return state.returns()
 
 
-def compare(game, policy_net, device, opponent_type):
+def compare(game, trained_bots, device, opponent_type):
     rng = np.random.default_rng(SEED)
     wins = losses = ties = 0
     returns = []
 
     for hand in range(NUM_HANDS):
+        # Alternate which trained bot is evaluated.
         deep_seat = hand % 2
-        opponent_seat = 1 - deep_seat
 
-        deep_bot = DeepCFRBot(
-            deep_seat, policy_net, device, seed=SEED + hand
-        )
+        # Start with six seats.
+        bots = [None] * 6
 
-        if opponent_type == "random":
-            opponent = pyspiel.make_uniform_random_bot(
-                opponent_seat, SEED + 10_000 + hand
+        # Seat the two trained bots.
+        bots[0] = trained_bots[0]
+        bots[1] = trained_bots[1]
+
+        # One passive bot.
+        bots[2] = PassiveBot(2)
+
+        # Three random bots.
+        for seat in range(3, 6):
+            bots[seat] = pyspiel.make_uniform_random_bot(
+                seat,
+                SEED + 10_000 * hand + seat
             )
-        elif opponent_type == "passive":
-            opponent = PassiveBot(opponent_seat)
-        else:
-            raise ValueError(opponent_type)
 
-        bots = [None, None]
-        bots[deep_seat] = deep_bot
-        bots[opponent_seat] = opponent
-
+        # Play only after all six seats have been assigned.
         result = play_hand(game, bots, rng)
+
         value = float(result[deep_seat])
         returns.append(value)
 
@@ -171,19 +171,25 @@ def compare(game, policy_net, device, opponent_type):
 
     print(f"\nDeep CFR vs {opponent_type}")
     print(f"Wins: {wins} | Losses: {losses} | Ties: {ties}")
+
     decisive = wins + losses
     print(
         "Win rate (excluding ties): "
-        f"{wins / decisive:.1%}" if decisive else "Win rate: n/a"
+        f"{wins / decisive:.1%}" if decisive
+        else "Win rate: n/a"
     )
     print(f"Mean return per hand: {np.mean(returns):.2f}")
     print(f"Total return: {np.sum(returns):.2f}")
 
 
 def main():
-    game, policy_net, device = load_policy()
-    compare(game, policy_net, device, "random")
-    compare(game, policy_net, device, "passive")
+    game, policy_net, device = load_policy(CHECKPOINT_PATH)
+    game, policy_net1, device = load_policy(CHECKPOINT_PATH_1)
+
+    deep_bot = DeepCFRBot(0, policy_net, device, seed=SEED + hand)
+    deep_bot1 = DeepCFRBot(1, policy_net1, device, seed=SEED + hand)
+
+    compare(game, [deep_bot, deep_bot1], device, "passive")
 
 
 if __name__ == "__main__":
