@@ -8,6 +8,7 @@ from tracking import make_logged_learn_advantage
 import numpy as np
 import torch
 from heuristicMC import HeuristicPokerBot
+import inspect
 
 # Make Python load our locally compiled OpenSpiel module first
 sys.path.insert(
@@ -28,7 +29,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # 2. TRAINING HYPERPARAMETERS
 validation_interval = 5
 VALIDATION_SEED = 42
-VALIDATION_HANDS = 400
+VALIDATION_HANDS = 2000
 BIG_BLIND = 2
 
 NUM_ITERATIONS = 20000
@@ -46,7 +47,7 @@ SEED = 42
 
 training_history = {"iteration": [],"player": [],
     "advantage_loss": [],"loss_policy_MSE": []}
-validation_history = {"iteration": [], "mean_return_bb": []}
+validation_history = {"iteration": [], "mean_return_bb": [],  "weighted_policy_loss": [], "unweighted_policy_loss": []}
 
 CHECKPOINT_PATH = os.path.join("models", f"deepcfr_policy_it{NUM_ITERATIONS}_tr{NUM_TRAVERSALS}.pt")
 # File where the trained policy and training metadata will be saved.
@@ -127,19 +128,19 @@ def solve_with_validation(game, solver, validate_fn, validation_history, trainin
         if completed_iteration % validation_interval == 0:
             policy_loss = solver._learn_strategy_network()
 
+            validation_history["weighted_policy_loss"].append(solver._last_weighted_policy_loss)
+            validation_history["unweighted_policy_loss"].append(solver._last_unweighted_policy_loss)
+
+            print(f"Policy MSE | Weighted: {solver._last_weighted_policy_loss:.6f} | Unweighted: {solver._last_unweighted_policy_loss:.6f}")
+
             mean_return_bb = validate_fn(solver._policy_network,i,game,device,validation_history,)
 
             input_size = game.information_state_tensor_size()
             output_size = game.num_distinct_actions()
-            checkpoint = {
-                "game_params": GAME_PARAMS,
-                "input_size": input_size,
-                "output_size": output_size,
-                "policy_hidden_sizes": POLICY_HIDDEN,
-                "seed": SEED,
-                # Learned neural-network parameters.
-                "policy_state_dict": solver._policy_network.state_dict()
-            }
+            checkpoint = {"game_params": GAME_PARAMS, "input_size": input_size, "output_size": output_size,
+                "policy_hidden_sizes": POLICY_HIDDEN, "advantage_hidden_sizes": ADVANTAGE_HIDDEN, "seed": SEED,
+                "policy_state_dict": solver._policy_network.state_dict(),
+                "advantage_state_dicts": [net.state_dict() for net in solver._advantage_networks]}
             plot_training(training_history, validation_history, validation_interval)
             torch.save(checkpoint, CHECKPOINT_PATH)
             print("Saved checkpoint:", CHECKPOINT_PATH)
@@ -171,14 +172,18 @@ def main():
         reinitialize_advantage_networks=True,device=device,seed=SEED,print_nash_convs=False,
     )
 
-    ###############################     LOAD
+    print("Deep CFR module:", deep_cfr.__file__)
+    print("Method source:", inspect.getsourcefile(type(solver)._learn_strategy_network))
+    print(inspect.getsource(type(solver)._learn_strategy_network))
 
+    ###############################     LOAD
+    model_name = f"deepcfr_policy_it20000_tr100BENCHMARK.pt"
     checkpoint = torch.load(
-        os.path.join("models", f"deepcfr_policy_it200_tr100.pt"),
+        os.path.join("models", model_name),
         map_location=device,
         weights_only=False,
     )
-    print(f"Loading warmup model: {os.path.join("models", f"deepcfr_policy_it200_tr100.pt")}")
+    print(f"Loading warmup model: {os.path.join("models", model_name)}")
     solver._policy_network.load_state_dict(
         checkpoint["policy_state_dict"]
     )
@@ -204,15 +209,11 @@ def main():
 
     # Save the policy weights and metadata needed to reconstruct a compatible model later. The advantage networks and solver
     # memories are not included in this policy checkpoint.
-    checkpoint = {
-        "game_params": GAME_PARAMS,
-        "input_size": input_size,
-        "output_size": output_size,
-        "policy_hidden_sizes": POLICY_HIDDEN,
-        "seed": SEED,
-        # Learned neural-network parameters.
-        "policy_state_dict": policy_net.state_dict()
-    }
+    print([name for name in vars(solver) if "advantage_network" in name])
+    checkpoint = {"game_params": GAME_PARAMS, "input_size": input_size, "output_size": output_size,
+        "policy_hidden_sizes": POLICY_HIDDEN, "advantage_hidden_sizes": ADVANTAGE_HIDDEN, "seed": SEED,
+        "policy_state_dict": solver._policy_network.state_dict(),
+        "advantage_state_dicts": [net.state_dict() for net in solver._advantage_networks]}
 
     torch.save(checkpoint, CHECKPOINT_PATH)
     print("Saved checkpoint:", CHECKPOINT_PATH)
